@@ -498,7 +498,21 @@ impl CustomScanClause<AggregateScan> for AggregateCSClause {
             }
         };
         // LimitOffset is optional - returns None when there is no LIMIT clause.
-        let limit_offset = LimitOffset::from_parse(args.root().parse);
+        //
+        // A WindowAgg above the aggregate consumes every grouped row: the WINDOW
+        // stage sits between UPPERREL_GROUP_AGG and the LIMIT, so folding the
+        // LIMIT into the terms bucket size would starve it — `count(*) OVER ()`
+        // above a GROUP BY would return the LIMIT instead of the group count
+        // (#6830). Mirrors the `hasWindowFuncs` guard in
+        // `detect_join_aggregate_topk`.
+        let limit_offset = {
+            let parse = args.root().parse;
+            if !parse.is_null() && unsafe { (*parse).hasWindowFuncs } {
+                None
+            } else {
+                LimitOffset::from_parse(parse)
+            }
+        };
         let quals = SearchQueryClause::from_pg(args, heap_rti, index)?;
 
         // The planner can simplify the operator out of the quals, so the query as written counts too.
@@ -672,6 +686,8 @@ impl CollectNested<GroupedKey> for AggregateCSClause {
             //    for TopK — see detect_aggregate_orderby for why non-COUNT is excluded)
             // 3. The LIMIT is statically known — parameterized LIMIT can't be
             //    folded into bucket size at planning time.
+            // 4. No window function sits above the scan (`from_pg` leaves
+            //    `limit_offset` unset in that case).
             let can_limit_buckets = grouping_columns.len() == 1
                 && (!self.orderby.has_orderby() || self.aggregate_orderby.is_some());
 
